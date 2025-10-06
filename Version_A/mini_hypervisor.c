@@ -52,11 +52,11 @@ struct vm {
 	int run_mmap_size; // KVM_RUN mmap size
 };
 
-int vm_init(struct vm *v, size_t mem_size);
-int load_guest_image(struct vm *v, const char *image_path, uint64_t load_addr);
-void setup_segments_64(struct kvm_sregs *sregs);
-void setup_long_mode(struct vm *v, struct kvm_sregs *sregs, size_t mem_size, size_t page_size);
-int setup_registers(struct vm *v, size_t mem_size);
+int kvm_init();
+void kvm_close(int kvm_fd);
+
+int vm_create(int kvm_fd, struct vm *v, size_t mem_size, size_t page_size, char *guest_image);
+int vm_run(struct vm *v);
 void vm_destroy(struct vm *v);
 
 
@@ -73,88 +73,30 @@ main(int argc, char *argv[])
     char *guest_image = NULL;
     if ((arg_status = parse_arguments(argc, argv, &mem_size, &page_size, &guest_image)) < 0)
         return arg_status;
-    
-    printf("Guest PM: %lu\n", mem_size);
-    printf("Page Size: %lu\n", page_size);
-    printf("Guest IMG: %s\n", guest_image);
-
-
-	struct vm v;
-	struct kvm_sregs sregs;
 	
-
-	if (vm_init(&v, mem_size)) {
-		printf("Failed to init the VM\n");
+	// Initializing KVM
+	int kvm_fd = kvm_init();
+	if (kvm_fd < 0){
 		return 1;
 	}
 
-	if (ioctl(v.vcpu_fd, KVM_GET_SREGS, &sregs) < 0) {
-		perror("KVM_GET_SREGS");
-		vm_destroy(&v);
-		return 1;
-	}
-
-	setup_long_mode(&v, &sregs, mem_size, page_size);
-
-    if (ioctl(v.vcpu_fd, KVM_SET_SREGS, &sregs) < 0) {
-		perror("KVM_SET_SREGS");
-		vm_destroy(&v);
-		return 1;
-	}
-
-	if (load_guest_image(&v, guest_image, GUEST_START_ADDR) < 0) {
-		printf("Failed to load guest image\n");
-		vm_destroy(&v);
-		return 1;
-	}
-
-	if (setup_registers(&v,mem_size) < 0){
-		vm_destroy(&v);
-		return 1;
+	// Creating a single VM
+	struct vm v;
+	int stat = vm_create(kvm_fd, &v, mem_size, page_size, guest_image);
+	if (stat < 0){
+		kvm_close(kvm_fd);
+		return -1;
 	}
 	
 	// Running the VM
-	int stop = 0;
-	int stat = 0;
-	printf("Starting the VM\n");
-	while(stop == 0) {
-		stat = ioctl(v.vcpu_fd, KVM_RUN, 0);
-		if (stat == -1) {
-			printf("KVM_RUN failed\n");
-			vm_destroy(&v);
-			return 1;
-		}
-
-		switch (v.run->exit_reason) {
-			case KVM_EXIT_IO:
-				if (v.run->io.port == 0xE9) 
-				{
-					switch (v.run->io.direction)
-					{
-					case KVM_EXIT_IO_OUT:
-						outb(&v);
-						break;
-					case KVM_EXIT_IO_IN:
-						inb(&v);
-						break;
-					}
-				}
-				continue;
-			case KVM_EXIT_HLT:
-				printf("KVM_EXIT_HLT\n");
-				stop = 1;
-				break;
-			case KVM_EXIT_SHUTDOWN:
-				printf("Shutdown\n");
-				stop = 1;
-				break;
-			default:
-				printf("Default - exit reason: %d\n", v.run->exit_reason);
-				break;
-    	}
-  	}
+	stat = vm_run(&v);
+	if (stat < 0){
+		kvm_close(kvm_fd);
+    	return 1;
+	}
 
 	vm_destroy(&v);
+	kvm_close(kvm_fd);
     return 0;
 }
 
@@ -242,34 +184,26 @@ parse_arguments(int argc, char *argv[], size_t *mem_size, size_t *page_size, cha
 }
 
 
-// KVM
+// VM Creation functions
+int vm_init(int kvm_fd, struct vm *v, size_t mem_size);
+int load_guest_image(struct vm *v, const char *image_path, uint64_t load_addr);
+void setup_segments_64(struct kvm_sregs *sregs);
+void setup_long_mode(struct vm *v, struct kvm_sregs *sregs, size_t mem_size, size_t page_size);
+int setup_registers(struct vm *v, size_t mem_size);
+
+
 int 
-vm_init(struct vm *v, size_t mem_size)
+vm_init(int kvm_fd, struct vm *v, size_t mem_size)
 {
 	struct kvm_userspace_memory_region region;	
 
 	memset(v, 0, sizeof(*v));
-	v->kvm_fd = v->vm_fd = v->vcpu_fd = -1;
+	v->kvm_fd = kvm_fd;
+	v->vm_fd = v->vcpu_fd = -1;
 	v->mem = MAP_FAILED;
 	v->run = MAP_FAILED;
 	v->run_mmap_size = 0;
 	v->mem_size = mem_size;
-
-    // Opening KVM
-	v->kvm_fd = open("/dev/kvm", O_RDWR);
-	if (v->kvm_fd < 0) 
-    {
-		perror("open /dev/kvm");
-		return -1;
-	}
-
-    // Checking KVM version
-    int api = ioctl(v->kvm_fd, KVM_GET_API_VERSION, 0);
-    if (api != KVM_API_VERSION) 
-    {
-        printf("KVM API mismatch: kernel=%d headers=%d\n", api, KVM_API_VERSION);
-        return -1;
-    }
 
     // Creating a VM via KVM
 	v->vm_fd = ioctl(v->kvm_fd, KVM_CREATE_VM, 0);
@@ -515,6 +449,139 @@ setup_registers(struct vm *v, size_t mem_size)
 	return 0;
 }
 
+
+// Guest service
+void 
+inb(struct vm *v)
+{
+	uint8_t value = getchar();
+	value = value != EOF ? value : 0;
+	*((char*)v->run + v->run->io.data_offset) = value;
+}
+
+void 
+outb(struct vm *v)
+{
+	char *p = (char *)v->run;
+	printf("%c", *(p + v->run->io.data_offset));
+}
+
+
+// KVM ctl and VM creation and ctl
+int 
+kvm_init()
+{
+	// Opening KVM
+	int kvm_fd = open("/dev/kvm", O_RDWR);
+	if (kvm_fd < 0) 
+    {
+		perror("open /dev/kvm");
+		return -1;
+	}
+
+    // Checking KVM version
+    int api = ioctl(kvm_fd, KVM_GET_API_VERSION, 0);
+    if (api != KVM_API_VERSION) 
+    {
+        printf("KVM API mismatch: kernel=%d headers=%d\n", api, KVM_API_VERSION);
+		close(kvm_fd);
+        return -1;
+    }
+
+	return kvm_fd;
+}
+
+void 
+kvm_close(int kvm_fd)
+{
+	if (kvm_fd >= 0) 
+    {
+		close(kvm_fd);
+	}
+}
+
+int 
+vm_create(int kvm_fd, struct vm *v, size_t mem_size, size_t page_size, char *guest_image)
+{
+	struct kvm_sregs sregs;
+	
+
+	if (vm_init(kvm_fd, v, mem_size)) {
+		printf("Failed to init the VM\n");
+		return 1;
+	}
+
+	if (ioctl(v->vcpu_fd, KVM_GET_SREGS, &sregs) < 0) {
+		perror("KVM_GET_SREGS");
+		vm_destroy(v);
+		return 1;
+	}
+
+	setup_long_mode(v, &sregs, mem_size, page_size);
+
+    if (ioctl(v->vcpu_fd, KVM_SET_SREGS, &sregs) < 0) {
+		perror("KVM_SET_SREGS");
+		vm_destroy(v);
+		return 1;
+	}
+
+	if (load_guest_image(v, guest_image, GUEST_START_ADDR) < 0) {
+		printf("Failed to load guest image\n");
+		vm_destroy(v);
+		return 1;
+	}
+
+	if (setup_registers(v,mem_size) < 0){
+		vm_destroy(v);
+		return 1;
+	}
+}
+
+int 
+vm_run(struct vm *v)
+{
+	int stop = 0;
+	int stat = 0;
+	printf("Starting the VM\n");
+	while(stop == 0) {
+		stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
+		if (stat == -1) {
+			printf("KVM_RUN failed\n");
+			vm_destroy(v);
+			return -1;
+		}
+
+		switch (v->run->exit_reason) {
+			case KVM_EXIT_IO:
+				if (v->run->io.port == 0xE9) 
+				{
+					switch (v->run->io.direction)
+					{
+					case KVM_EXIT_IO_OUT:
+						outb(v);
+						break;
+					case KVM_EXIT_IO_IN:
+						inb(v);
+						break;
+					}
+				}
+				continue;
+			case KVM_EXIT_HLT:
+				printf("KVM_EXIT_HLT\n");
+				stop = 1;
+				break;
+			case KVM_EXIT_SHUTDOWN:
+				printf("Shutdown\n");
+				stop = 1;
+				break;
+			default:
+				printf("Default - exit reason: %d\n", v->run->exit_reason);
+				break;
+    	}
+  	}
+	return 0;
+}
+
 void 
 vm_destroy(struct vm *v) 
 {
@@ -531,7 +598,7 @@ vm_destroy(struct vm *v)
 		v->mem = MAP_FAILED;
 	}
 
-    // Closing VCPU, VM and KVM
+    // Closing VCPU and VM
 	if (v->vcpu_fd >= 0) 
     {
 		close(v->vcpu_fd);
@@ -543,25 +610,4 @@ vm_destroy(struct vm *v)
 		close(v->vm_fd);
 		v->vm_fd = -1;
 	}
-
-	if (v->kvm_fd >= 0) 
-    {
-		close(v->kvm_fd);
-		v->kvm_fd = -1;
-	}
-}
-
-void 
-inb(struct vm *v)
-{
-	uint8_t value = getchar();
-	value = value != EOF ? value : 0;
-	*((char*)v->run + v->run->io.data_offset) = value;
-}
-
-void 
-outb(struct vm *v)
-{
-	char *p = (char *)v->run;
-	printf("%c", *(p + v->run->io.data_offset));
 }
