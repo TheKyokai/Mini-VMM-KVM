@@ -37,10 +37,18 @@
 #define MAP_TABLE_SIZE (1u << 9)
 #define MAP_TABLE_OFFSET (1u << 12)
 
+// Guest Img List
+struct file_node {
+	char* file_name;
+	struct file_node *next;
+};
+
+char* get_file(struct file_node **head);
+void push_file(struct file_node **head, char *name);
 
 
 // Data Loading
-int parse_arguments(int argc, char *argv[], size_t *mem_size, size_t *page_size, char **guest_image);
+int parse_arguments(int argc, char *argv[], size_t *mem_size, size_t *page_size, struct file_node **guest_list);
 
 // KVM 
 struct vm {
@@ -69,9 +77,9 @@ struct vm_node {
     struct vm_node *next;
 };
 
-struct vm_node* get_node(struct vm_node *head, int index);
-void push_node(struct vm_node **head, struct vm_node *node);
-struct vm_node* remove_node(struct vm_node **head);
+struct vm_node* get_node_vm(struct vm_node *head, int index);
+void push_node_vm(struct vm_node **head, struct vm_node *node);
+struct vm_node* remove_node_vm(struct vm_node **head);
 
 
 // IN/OUT
@@ -82,11 +90,14 @@ void outb(struct vm *v);
 int 
 main(int argc, char *argv[])
 {
-    int arg_status, vm_count = 2;
+    int arg_status;
     size_t mem_size, page_size;
-    char *guest_image = NULL;
-    if ((arg_status = parse_arguments(argc, argv, &mem_size, &page_size, &guest_image)) < 0)
+	struct file_node *guest_list = NULL;
+    if ((arg_status = parse_arguments(argc, argv, &mem_size, &page_size, &guest_list)) < 0)
         return arg_status;
+	
+	printf("MP_Size: %lu\n",mem_size);
+	printf("PG_Size: %lu\n",page_size);
 	
     struct vm_node *head = NULL;
 
@@ -96,27 +107,32 @@ main(int argc, char *argv[])
 		return 1;
 	}
 
-    for (int i=0; i<vm_count; i++)
+    while (guest_list)
     {
         struct vm_node *node = (struct vm_node*) malloc(sizeof(struct vm_node));
         node->next = NULL;
-        int stat = vm_create(kvm_fd, &node->v, mem_size, page_size, guest_image);
-        if (stat < 0)
-            continue;
+		char *guest = get_file(&guest_list);
+		printf("Guest: %s\n", guest);
+        int stat = vm_create(kvm_fd, &node->v, mem_size, page_size, guest);
+        if (stat != 0)
+		{
+			free(node);
+			continue;
+		}
         pthread_t thread_id;
         stat = pthread_create(&thread_id, NULL, vm_start, (void*)(&node->v));
         if (stat != 0)
         {
-            free(node);
-            vm_destroy(&node->v);
+            vm_destroy(&(node->v));
+			free(node);
             continue;
         }
         node->thread_id = thread_id;
-        push_node(&head, node);
+        push_node_vm(&head, node);
     }
 
     struct vm_node *current_wait = NULL;
-    while ((current_wait = remove_node(&head)) != NULL)
+    while ((current_wait = remove_node_vm(&head)) != NULL)
     {
         pthread_join(current_wait->thread_id, NULL);
     }
@@ -127,7 +143,7 @@ main(int argc, char *argv[])
 
 // Data Loading
 int 
-parse_arguments(int argc, char *argv[], size_t *mem_size, size_t *page_size, char **guest_image)
+parse_arguments(int argc, char *argv[], size_t *mem_size, size_t *page_size, struct file_node **guest_list)
 {
     if (argc < 7)
     {
@@ -137,7 +153,7 @@ parse_arguments(int argc, char *argv[], size_t *mem_size, size_t *page_size, cha
     int mem_done = 0;
     int page_done = 0;
     int guest_done = 0;
-    for (int i=1; i<6; i+=2)
+    for (int i=1; i<argc; i+=2)
     {
         if ((!strcmp("--memory", argv[i]) || !strcmp("-m", argv[i])) && !mem_done)
         {
@@ -190,7 +206,19 @@ parse_arguments(int argc, char *argv[], size_t *mem_size, size_t *page_size, cha
         }
         if ((!strcmp("--guest", argv[i]) || !strcmp("-g", argv[i])) && !guest_done)
         {
-            *guest_image =  argv[i+1];
+            char * image = argv[i+1];
+			push_file(guest_list, image);
+			if (argc <= i+2)
+			{
+				guest_done = 1;
+				continue;
+			}
+			while (argc > i+2 && argv[i+2][0] != '-')
+			{
+				i++;
+				image = argv[i+1];
+				push_file(guest_list, image);
+			}
             guest_done = 1;
         }
     }
@@ -364,7 +392,6 @@ setup_long_mode(struct vm *v, struct kvm_sregs *sregs, size_t mem_size, size_t p
 {
 	// 9 bits are used for adressing the table => 512 entries per table => tables aligned on 4KB (12 zeros)
 	uint64_t page_count = mem_size/page_size; // Pages required for covering physical memory
-	printf("Page Count: %lu\n",page_count);
 	uint64_t pt_count = page_count/MAP_TABLE_SIZE; // Last level tables required for above mentioned pages
 	uint64_t current_address;
 	
@@ -452,9 +479,9 @@ setup_long_mode(struct vm *v, struct kvm_sregs *sregs, size_t mem_size, size_t p
 	sregs->efer = EFER_LME | EFER_LMA; // "Long Mode Active" and "Long Mode Enable"
 
 	// 64-bit segment initialization
-	printf("Setting up segments\n");
+	// printf("Setting up segments\n");
 	setup_segments_64(sregs);
-	printf("Done setting up long mode\n");
+	// printf("Done setting up long mode\n");
 }
 
 int 
@@ -585,11 +612,9 @@ vm_run(struct vm *v, pthread_t thread_id)
 					switch (v->run->io.direction)
 					{
 					case KVM_EXIT_IO_OUT:
-                        // printf("Thread %lu KVM_EXIT_IO_OUT\n", thread_id);
 						outb(v);
 						break;
 					case KVM_EXIT_IO_IN:
-						// printf("Thread %lu KVM_EXIT_IO_IN\n", thread_id);
 						inb(v);
 						break;
 					}
@@ -600,11 +625,9 @@ vm_run(struct vm *v, pthread_t thread_id)
 				stop = 1;
 				break;
 			case KVM_EXIT_SHUTDOWN:
-				printf("Thread %lu Shutdown\n", thread_id);
 				stop = 1;
 				break;
 			default:
-				printf("Thread %lu Default - exit reason: %d\n", thread_id, v->run->exit_reason);
 				break;
     	}
   	}
@@ -654,7 +677,7 @@ vm_start(void* vm)
 
 // VM Thread List
 struct vm_node* 
-get_node(struct vm_node *head, int index)
+get_node_vm(struct vm_node *head, int index)
 {
     struct vm_node *current = head;
     int id = 0;
@@ -668,7 +691,7 @@ get_node(struct vm_node *head, int index)
 }
 
 void 
-push_node(struct vm_node **head, struct vm_node *node)
+push_node_vm(struct vm_node **head, struct vm_node *node)
 {
     if (!*head)
     {
@@ -681,7 +704,7 @@ push_node(struct vm_node **head, struct vm_node *node)
 }
 
 struct vm_node* 
-remove_node(struct vm_node **head)
+remove_node_vm(struct vm_node **head)
 {
     if (!*head)
         return NULL;
@@ -691,3 +714,34 @@ remove_node(struct vm_node **head)
     return node;
 }
 
+// Guest Img List
+char* 
+get_file(struct file_node **head)
+{
+	if (!head || !*head) return NULL;
+	struct file_node *node = *head;
+	*head = (*head)->next;
+	char* ret = node->file_name;
+	free(node);
+	return ret;
+}
+
+void 
+push_file(struct file_node **head, char *name)
+{
+	if (!head) return;
+	if (!*head)
+	{
+		*head = (struct file_node*) malloc(sizeof(struct file_node));
+		(*head)->file_name = name;
+		(*head)->next = NULL;
+		return;
+	}
+	struct file_node *current = *head;
+	for (; current->next; current = current->next);
+	struct file_node *node = (struct file_node*) malloc(sizeof(struct file_node));
+	node->file_name = name;
+	node->next = NULL;
+	current->next = node;
+	return;
+}

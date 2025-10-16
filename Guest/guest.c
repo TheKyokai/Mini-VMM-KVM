@@ -38,11 +38,11 @@ _start(void) {
 	*/
 	uint8_t val;
 	print("Hello World!\n");
-	while ((val = inb()) != '\n')
-	{
-		print(&val);
-	}
-	print("\n");
+	// while ((val = inb()) != '\n')
+	// {
+	// 	print(&val);
+	// }
+	// print("\n");
 
 	/*
 		INSERT CODE ABOVE THIS LINE
