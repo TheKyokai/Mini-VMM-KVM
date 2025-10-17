@@ -171,6 +171,7 @@ _start(void) {
 	char * buffer = "Not ReadP";
 	print(buffer);
 	print("\n");
+	
 	fopen(&file, "text_file.txt", FO_RDWR);
 	
 	fread(&file, buffer, 1, 10);

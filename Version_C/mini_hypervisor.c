@@ -54,7 +54,7 @@ struct file_node
 
 char* get_file(struct file_node **head);
 struct file_node* get_file_at(struct file_node *head, int index);
-void push_file(struct file_node **head, char *name);
+struct file_node* push_file(struct file_node **head, char *name);
 
 // File CTL List 
 struct file_ctl_node
@@ -817,10 +817,10 @@ get_file_at(struct file_node *head, int index)
     return current;
 }
 
-void 
+struct file_node* 
 push_file(struct file_node **head, char *name)
 {
-	if (!head) return;
+	if (!head) return NULL;
     sem_t* mutex = (sem_t*)malloc(sizeof(sem_t));
     sem_init(mutex, 0, 1);
 	if (!*head)
@@ -831,7 +831,7 @@ push_file(struct file_node **head, char *name)
 		(*head)->next = NULL;
         (*head)->ref_cnt = 0;
         (*head)->mutex = mutex;
-		return;
+		return *head;
 	}
 	struct file_node *current = *head;
 	for (; current->next; current = current->next);
@@ -843,7 +843,7 @@ push_file(struct file_node **head, char *name)
     node->mutex = mutex;
 
 	current->next = node;
-	return;
+	return node;
 }
 
 // File CTL
@@ -925,6 +925,81 @@ translateAddr(struct vm* v, uint64_t guest_addr)
 #define FO_RD 0x1
 #define FO_WR 0x2
 #define FO_RDWR 0x3
+
+
+char* 
+get_name(char* old_name)
+{
+    char num_str[32];
+    sprintf(num_str, "%lu", pthread_self());
+    
+    const char* dot = strrchr(old_name, '.');
+
+    
+    char* new_name_buffer = malloc(256);
+    if (!new_name_buffer) return NULL;
+
+    if (dot) 
+    {
+        size_t base_len = dot - old_name;
+        snprintf(new_name_buffer, 256, "%.*s_%s%s",
+                 (int)base_len, old_name, num_str, dot);
+    } 
+    else 
+    {
+        
+        snprintf(new_name_buffer, 256, "%s_%s", old_name, num_str);
+    }
+
+    return new_name_buffer;
+
+}
+
+int 
+create_copy_on_write(struct file_ctl_node * node)
+{
+    char * new_name = get_name(node->file_node->file_name);
+    if (!new_name)
+        return -1;
+    sem_t *mutex = node->file_node->mutex;
+    sem_wait(mutex);
+    struct file_node* fn = node->file_node;
+    printf("Copying %s to %s\n", fn->file_name, new_name);
+
+    FILE* tempIn = fopen(fn->file_name, "rb");
+    if (tempIn <= 0){
+        sem_post(mutex);
+        return-1;
+    }
+    FILE* tempOut = fopen(new_name, "wb");
+    if (tempOut <= 0){
+        fclose(tempIn);
+        sem_post(mutex);
+        return-1;
+    }
+    char buffer[8192];
+    size_t n;
+    while ((n = fread(buffer, 1, sizeof(buffer), tempIn)) > 0) 
+        fwrite(buffer, 1, n, tempOut);
+    
+    fclose(tempIn);
+    fclose(tempOut);
+
+    fn->ref_cnt--;
+    if (fn->ref_cnt == 0 && fn->file != NULL)
+        fclose(fn->file);
+
+    
+    struct file_node* fn_new = push_file(&file_list, new_name);
+
+    node->shared = 0;
+    node->file_node = fn_new;
+
+    fn_new->ref_cnt++;
+    fn_new->file = fopen(new_name, "r+");
+    sem_post(mutex);
+    return 0;
+}
 
 
 int 
@@ -1023,7 +1098,7 @@ handleFclose(struct vm* v)
     else 
         return -1;
 
-    printf("Guest File Desc: %u\n", file_desc);
+    // printf("Guest File Desc: %u\n", file_desc);
 
     int status;
     struct file_ctl_node * current = v->files;
@@ -1200,7 +1275,7 @@ handleFseek(struct vm* v)
         while (current && current->fd != file_desc)
             current = current->next;
         current->cursor = offset;
-        printf("New Cursor Position: %lu\n", current->cursor);
+        // printf("New Cursor Position: %lu\n", current->cursor);
         status = 0;
     }
 
@@ -1278,7 +1353,9 @@ handleFwrite(struct vm* v)
     else 
         return -1;
 
+    // Writting logic
     int written = 0;
+    int status = 0;
     if (file_desc > 0)
     {
         struct file_ctl_node * current = v->files;
@@ -1286,23 +1363,17 @@ handleFwrite(struct vm* v)
             current = current->next;
         if (current && current->operations & FO_WR)
         {
-            sem_t *mutex = current->file_node->mutex;
-            sem_wait(mutex);
-            struct file_node* fn = current->file_node;
-            FILE* file = fn->file;
-            if (fn->file == NULL)
-                if (current->operations & FO_RDWR)
-                    fn->file = fopen(fn->file_name, "w+");
-                else 
-                    fn->file = fopen(fn->file_name, "w");
-            
-            if (fn->file > 0)
+            if (current->shared)
             {
-                fseek(fn->file, current->cursor, SEEK_SET);
-                written = fwrite(buffer, size, nmemb, fn->file);
-                current->cursor = ftell(fn->file);
+                status = create_copy_on_write(current);
             }
-            sem_post(mutex);
+            if (!status)
+            {
+                FILE* file = current->file_node->file;
+                fseek(file, current->cursor, SEEK_SET);
+                written = fwrite(buffer, size, nmemb, file);
+                current->cursor = ftell(file);
+            } 
         }
     }
     
