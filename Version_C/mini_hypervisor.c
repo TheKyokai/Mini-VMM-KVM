@@ -945,7 +945,6 @@ get_name(char* old_name)
     }
 
     return new_name_buffer;
-
 }
 
 int 
@@ -954,10 +953,8 @@ create_copy_on_write(struct file_ctl_node * node)
     char * new_name = get_name(node->name);
     if (!new_name)
         return -1;
-    
+        
     FILE* tempIn = fopen(node->name, "rb");
-    if (tempIn <= 0)
-        return-1;
     
     FILE* tempOut = fopen(new_name, "wb");
     if (tempOut <= 0){
@@ -965,12 +962,16 @@ create_copy_on_write(struct file_ctl_node * node)
         return-1;
     }
 
-    char buffer[8192];
+    if (tempIn > 0)
+    {
+        char buffer[8192];
     size_t n;
     while ((n = fread(buffer, 1, sizeof(buffer), tempIn)) > 0) 
         fwrite(buffer, 1, n, tempOut);
+    }
     
-    fclose(tempIn);
+    if (tempIn > 0)
+        fclose(tempIn);
     fclose(tempOut);
 
     uint32_t offset = 0;
@@ -980,11 +981,11 @@ create_copy_on_write(struct file_ctl_node * node)
         fclose(node->handle);
     }
 
-    
     node->shared = 0;
     node->actual_name = new_name;
-
     node->handle = fopen(node->actual_name, "r+");
+    if (offset)
+        fseek(node->handle, offset, SEEK_SET);
     return 0;
 }
 
@@ -1033,7 +1034,7 @@ handleFopen(struct vm* v)
     {
         if (open_flags == FO_RD && fctl_node->handle == NULL) // File exists check
         {
-            FILE* f = fopen(file_path, "r");
+            FILE* f = fopen(fctl_node->actual_name, "r");
             if (f > 0)
             {
                 file_exists = 1;
@@ -1081,7 +1082,7 @@ handleFclose(struct vm* v)
     else 
         return -1;
 
-    printf("Guest File Desc Close: %u\n", file_desc);
+    // printf("Guest File Desc Close: %u\n", file_desc);
 
     int status;
     struct file_ctl_node * current = v->files;
@@ -1177,7 +1178,7 @@ handleFread(struct vm* v)
         return -1;
 
 
-    printf("Guest File Desc Read: %u\n", file_desc);
+    // printf("Guest File Desc Read: %u\n", file_desc);
 
     int read = 0;
     if (file_desc > 0)
@@ -1190,6 +1191,7 @@ handleFread(struct vm* v)
             FILE* file = current->handle;
             if (file == NULL)
             {
+                // printf("FILE NOT OPEN - Opening with 'r'\n");
                 file = fopen(current->actual_name, "r");
                 current->handle = file;
             }
@@ -1254,19 +1256,23 @@ handleFseek(struct vm* v)
         
         if (current && current->operations > 0)
         {   
-            if (current->operations & FO_RD)
+            if (current->handle == NULL)
             {
-                current->handle = fopen(current->actual_name, "r");
-            }
-            else 
-            {
-                status = create_copy_on_write(current);
+                if (current->operations & FO_RD)
+                {
+                    current->handle = fopen(current->actual_name, "r+");
+                }
+                else 
+                {
+                    if (current->shared)
+                        status = create_copy_on_write(current);
+                    else 
+                        current->handle = fopen(current->actual_name, "r+");
+                }
             }
             if (current->handle)
                 status = fseek(current->handle, offset, SEEK_SET);  
         }
-
-        // printf("New Cursor Position: %lu\n", current->cursor);
         status = 0;
     }
 
@@ -1299,8 +1305,6 @@ handleFwrite(struct vm* v)
         file_desc = *((uint32_t*)((char*)v->run + v->run->io.data_offset));
     else 
         return -1;
-
-    printf("Guest File Desc Write: %u\n", file_desc);
 
     stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
     if (stat == -1) 
@@ -1344,6 +1348,8 @@ handleFwrite(struct vm* v)
     else 
         return -1;
 
+    // printf("Guest File Desc Write: %u\n", file_desc);
+    
     // Writting logic
     int written = 0;
     int status = 0;

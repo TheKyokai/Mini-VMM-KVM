@@ -168,22 +168,12 @@ _start(void) {
 		INSERT CODE BELOW THIS LINE
 	*/
 	FILE file;
-	char * buffer = "Not ReadP";
 
-	fopen(&file, "text_file.txt", FO_RDWR);
-	
-	fread(&file, buffer, 1, 9);
+	fopen(&file, "another_file.txt", FO_RDWR);
 
-	print(buffer);
-	print("\n");
+	char* wbuffer = "WriteAnoter";
+	fwrite(&file, wbuffer, 1, 12);
 
-	fseek(&file, 0);
-
-	char * new_buffer = "No ReadP2";
-	fread(&file, new_buffer, 1, 9);
-
-	print(new_buffer);
-	print("\n");
 
 	fclose(&file);
 
