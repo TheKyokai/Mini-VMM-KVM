@@ -142,7 +142,7 @@ main(int argc, char *argv[])
         struct vm_node *node = (struct vm_node*) malloc(sizeof(struct vm_node));
         node->next = NULL;
 		char *guest = get_file(&guest_list);
-		printf("Guest: %s\n", guest);
+		printf("Loading Guest: %s\n", guest);
         int stat = vm_create(kvm_fd, &node->v, mem_size, page_size, guest);
         if (stat != 0)
 		{
@@ -948,6 +948,42 @@ get_name(char* old_name)
 }
 
 int 
+make_private_file(struct vm* v, char* name, int flags)
+{
+    int ret_fd = -1;
+    char* local_name = get_name(name);
+    if (!local_name)
+        return ret_fd;
+    FILE* private_file = NULL;
+    char * o_flags = NULL;
+    if (flags == FO_WR)
+        o_flags = "w";
+    else if (flags == FO_RDWR)
+        o_flags = "w+";
+    if (o_flags == NULL)
+        return ret_fd;
+    private_file = fopen(local_name, o_flags);
+    if (private_file <= 0)
+        return ret_fd;
+    
+    struct file_ctl_node* node = malloc(sizeof(struct file_ctl_node));
+    ret_fd = v->next_fd++;
+    node->name = name;
+    node->actual_name = local_name;
+    node->fd = ret_fd;
+    node->handle = private_file;
+    node->next = NULL;
+    node->operations = flags;
+    node->shared = 0;
+
+    // printf("NAMES:\n%s\n%s\n",name,local_name);
+    // printf("FD: %d\n",ret_fd);
+
+    push_file_ctl(&v->files, node);
+    return ret_fd;
+}
+
+int 
 create_copy_on_write(struct file_ctl_node * node)
 {
     char * new_name = get_name(node->name);
@@ -1050,6 +1086,10 @@ handleFopen(struct vm* v)
             fctl_node->operations = open_flags;
         }
     }
+    else if (!fctl_node && open_flags != FO_RD)
+    {
+        ret_fd = make_private_file(v, file_path, open_flags);
+    }
     
     // Returning the fd
     stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
@@ -1095,6 +1135,8 @@ handleFclose(struct vm* v)
         {
             if (current->handle != NULL)
                 fclose(current->handle);
+            // printf("File Closed\n");
+            current->handle = NULL;
             current->operations = 0;
             current->fd = 0;
             status = 0;

@@ -169,14 +169,22 @@ _start(void) {
 	*/
 	FILE file;
 
-	fopen(&file, "another_file.txt", FO_RDWR);
+	fopen(&file, "private_file.txt", FO_WR);
 
-	char* wbuffer = "WriteAnoter";
-	fwrite(&file, wbuffer, 1, 12);
-
+	char* wbuffer = "WritePrivate";
+	fwrite(&file, wbuffer, 1, 13);
 
 	fclose(&file);
 
+	char* tbuffer = "123456891212";
+	fopen(&file, "private_file.txt", FO_RD);
+
+	fread(&file, tbuffer, 1, 13);
+
+	print(tbuffer);
+	print("\n");
+
+	fclose(&file);
 	
 
 	/*
