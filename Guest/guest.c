@@ -167,22 +167,22 @@ _start(void) {
 	/*
 		INSERT CODE BELOW THIS LINE
 	*/
+
 	FILE file;
 
-	fopen(&file, "private_file.txt", FO_WR);
+	char* buffer = "Guest 0 Write Data";
 
-	char* wbuffer = "WritePrivate";
-	fwrite(&file, wbuffer, 1, 13);
-
+	fopen(&file, "text_file.txt", FO_WR);
+	fwrite(&file, buffer, 1, 19);
 	fclose(&file);
 
-	char* tbuffer = "123456891212";
-	fopen(&file, "private_file.txt", FO_RD);
-
-	fread(&file, tbuffer, 1, 13);
-
-	print(tbuffer);
+	print(buffer);
 	print("\n");
+
+	fopen(&file, "private_file_guest0.txt", FO_WR);
+
+	char* wbuffer = "Write Private Guest0";
+	fwrite(&file, wbuffer, 1, 21);
 
 	fclose(&file);
 	

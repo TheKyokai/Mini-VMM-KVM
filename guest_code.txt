@@ -1,0 +1,47 @@
+GUEST && GUEST_1
+
+
+
+	FILE file;
+
+	char* buffer = "Guest 1 Write Data";
+
+	fopen(&file, "text_file.txt", FO_WR);
+	fwrite(&file, buffer, 1, 19);
+	fclose(&file);
+
+	print(buffer);
+	print("\n");
+
+	fopen(&file, "private_file_guest1.txt", FO_WR);
+
+	char* wbuffer = "Write Private Guest1";
+	fwrite(&file, wbuffer, 1, 21);
+
+	fclose(&file);
+
+
+
+GUEST_2
+
+
+
+	FILE file;
+
+	char buffer[19];
+	buffer[18] = '\0';
+
+	fopen(&file, "text_file.txt", FO_RD);
+	fread(&file, buffer, 1, 18);
+	fclose(&file);
+
+	print(buffer);
+	print("\n");
+
+	fopen(&file, "private_file_guest2.txt", FO_WR);
+
+	char* wbuffer = "Write Private Guest2";
+	fwrite(&file, wbuffer, 1, 21);
+
+	fclose(&file);
+	
