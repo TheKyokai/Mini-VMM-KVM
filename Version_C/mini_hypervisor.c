@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <linux/kvm.h>
 #include <pthread.h>
+#include <semaphore.h>
 
 // Guest Code Start
 #define GUEST_START_ADDR 0x0000 
@@ -45,15 +46,34 @@
 struct file_node
 {
 	char* file_name;
+    sem_t* mutex;
+    FILE* file;
+    int ref_cnt;
 	struct file_node *next;
 };
 
 char* get_file(struct file_node **head);
+struct file_node* get_file_at(struct file_node *head, int index);
 void push_file(struct file_node **head, char *name);
 
+// File CTL List 
+struct file_ctl_node
+{
+    char* name;
+    uint32_t fd;
+    uint8_t shared;
+    uint8_t operations;
+    uint64_t cursor;
+    struct file_node* file_node;
+    struct file_ctl_node *next;
+};
+
+struct file_ctl_node* get_file_ctl(struct file_ctl_node **head);
+struct file_ctl_node* get_file_ctl_at(struct file_ctl_node *head, int index);
+void push_file_ctl(struct file_ctl_node **head, struct file_ctl_node *node);
 
 // Data Loading
-int parse_arguments(int argc, char *argv[], size_t *mem_size, size_t *page_size, struct file_node **guest_list);
+int parse_arguments(int argc, char *argv[], size_t *mem_size, size_t *page_size, struct file_node **guest_list, struct file_node **file_list);
 
 // KVM 
 struct vm
@@ -65,6 +85,8 @@ struct vm
 	size_t mem_size; // Mapped guest mem size
 	struct kvm_run *run; 
 	int run_mmap_size; // KVM_RUN mmap size
+    struct file_ctl_node *files;
+    int next_fd;
 };
 
 int kvm_init();
@@ -96,17 +118,16 @@ void outb(struct vm *v);
 // File operation handler
 int handleFilePortOperation(struct vm* v);
 
+struct file_node *file_list = NULL;
+
 int 
 main(int argc, char *argv[])
 {
     int arg_status;
     size_t mem_size, page_size;
 	struct file_node *guest_list = NULL;
-    if ((arg_status = parse_arguments(argc, argv, &mem_size, &page_size, &guest_list)) < 0)
+    if ((arg_status = parse_arguments(argc, argv, &mem_size, &page_size, &guest_list, &file_list)) < 0)
         return arg_status;
-	
-	printf("MP_Size: %lu\n",mem_size);
-	printf("PG_Size: %lu\n",page_size);
 	
     struct vm_node *head = NULL;
 
@@ -128,6 +149,23 @@ main(int argc, char *argv[])
 			free(node);
 			continue;
 		}
+        node->v.next_fd = 1;
+        int i=0;
+        struct file_node* fnode = get_file_at(file_list, i);
+        while (fnode)
+        {
+            struct file_ctl_node * fctl_node = (struct file_ctl_node*)malloc(sizeof(struct file_ctl_node));
+            fctl_node->cursor = 0;
+            fctl_node->file_node = fnode;
+            fctl_node->name = fnode->file_name;
+            fctl_node->operations = 0;
+            fctl_node->shared = 1;
+            fctl_node->next = NULL;
+            push_file_ctl(&node->v.files, fctl_node);
+
+            fnode = get_file_at(file_list, ++i);
+        }
+
         pthread_t thread_id;
         stat = pthread_create(&thread_id, NULL, vm_start, (void*)(&node->v));
         if (stat != 0)
@@ -152,16 +190,17 @@ main(int argc, char *argv[])
 
 // Data Loading
 int 
-parse_arguments(int argc, char *argv[], size_t *mem_size, size_t *page_size, struct file_node **guest_list)
+parse_arguments(int argc, char *argv[], size_t *mem_size, size_t *page_size, struct file_node **guest_list, struct file_node **file_list)
 {
-    if (argc < 7)
+    if (argc < 9)
     {
-        printf("Error: incorrect command format\nCorrect format: ./mini_hypervisor <--memory/-m> <2/4/8(MB)> <--page/-p> <4(KB)/2(MB)> <--guest/-g> <guest image file>\nAll arguments are mandatory\n");
+        printf("Error: incorrect command format\nCorrect format: ./mini_hypervisor <--memory/-m> <2/4/8(MB)> <--page/-p> <4(KB)/2(MB)> <--guest/-g> <guest image files> <--file/-f> <file paths>\nAll arguments are mandatory\n");
         return -1;
     }
     int mem_done = 0;
     int page_done = 0;
     int guest_done = 0;
+    int file_done = 0;
     for (int i=1; i<argc; i+=2)
     {
         if ((!strcmp("--memory", argv[i]) || !strcmp("-m", argv[i])) && !mem_done)
@@ -230,8 +269,25 @@ parse_arguments(int argc, char *argv[], size_t *mem_size, size_t *page_size, str
 			}
             guest_done = 1;
         }
+        if ((!strcmp("--file", argv[i]) || !strcmp("-f", argv[i])) && !file_done)
+        {
+            char * file = argv[i+1];
+			push_file(file_list, file);
+			if (argc <= i+2)
+			{
+				file_done = 1;
+				continue;
+			}
+			while (argc > i+2 && argv[i+2][0] != '-')
+			{
+				i++;
+				file = argv[i+1];
+				push_file(file_list, file);
+			}
+            file_done = 1;
+        }
     }
-    if (guest_done && mem_done && page_done)
+    if (guest_done && mem_done && page_done && file_done)
         return 0;
 
     printf("Error: Not all provided arguments are valid\n");
@@ -240,7 +296,9 @@ parse_arguments(int argc, char *argv[], size_t *mem_size, size_t *page_size, str
     if (!page_done)
         printf("Page size not specified\nUse: --page/-p 4(KB)/2(MB)\n");
     if (!guest_done)
-        printf("Guest image file not specified\nUse: --guest/-g <guest image file>\n");
+        printf("Guest image file not specified\nUse: --guest/-g <guest image files>\n");
+    if (!file_done)
+        printf("Files not specified\nUse: --file/-f <file paths>\n");
     
     return -4;
 }
@@ -745,25 +803,88 @@ get_file(struct file_node **head)
 	return ret;
 }
 
+struct file_node* 
+get_file_at(struct file_node *head, int index)
+{
+    struct file_node *current = head;
+    int id = 0;
+    while (current){
+        if (id == index)
+            break;
+        id++;
+        current = current->next;
+    }
+    return current;
+}
+
 void 
 push_file(struct file_node **head, char *name)
 {
 	if (!head) return;
+    sem_t* mutex = (sem_t*)malloc(sizeof(sem_t));
+    sem_init(mutex, 0, 1);
 	if (!*head)
 	{
 		*head = (struct file_node*) malloc(sizeof(struct file_node));
 		(*head)->file_name = name;
+        (*head)->file = NULL;
 		(*head)->next = NULL;
+        (*head)->ref_cnt = 0;
+        (*head)->mutex = mutex;
 		return;
 	}
 	struct file_node *current = *head;
 	for (; current->next; current = current->next);
 	struct file_node *node = (struct file_node*) malloc(sizeof(struct file_node));
 	node->file_name = name;
+    node->file = NULL;
 	node->next = NULL;
+    node->ref_cnt = 0;
+    node->mutex = mutex;
+
 	current->next = node;
 	return;
 }
+
+// File CTL
+struct file_ctl_node* 
+get_file_ctl(struct file_ctl_node **head)
+{
+    if (!head || !*head) return NULL;
+	struct file_ctl_node *node = *head;
+	*head = (*head)->next;
+	return node;
+}
+
+struct file_ctl_node* 
+get_file_ctl_at(struct file_ctl_node *head, int index)
+{
+    struct file_ctl_node *current = head;
+    int id = 0;
+    while (current){
+        if (id == index)
+            break;
+        id++;
+        current = current->next;
+    }
+    return current;
+}
+
+void 
+push_file_ctl(struct file_ctl_node **head, struct file_ctl_node *node)
+{
+    if (!head) return;
+	if (!*head)
+	{
+		*head = node;
+		return;
+	}
+	struct file_ctl_node *current = *head;
+	for (; current->next; current = current->next);
+	current->next = node;
+	return;
+}
+
 
 uint64_t 
 translateAddr(struct vm* v, uint64_t guest_addr)
@@ -825,7 +946,7 @@ handleFopen(struct vm* v)
         return -1;
 
     char *file_path = (char*)translateAddr(v, file_handle);
-    printf("Guest File: %s\n", file_path);
+    
 
     stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
     if (stat == -1) 
@@ -840,13 +961,54 @@ handleFopen(struct vm* v)
     else 
         return -1;
 
-    printf("Open flags: %d\n", open_flags);
+    // printf("Guest File: %s\n", file_path);
+    // printf("Open flags: %d\n", open_flags);
+
+    struct file_ctl_node* fctl_node = v->files;
+    int ret_fd = -1, file_exists = 0;
+    while (fctl_node && strcmp(file_path, fctl_node->name) != 0)
+        fctl_node = fctl_node->next;
+    if (fctl_node && fctl_node->operations == 0) // File provided as argument check
+    {
+        if (open_flags & FO_RD && fctl_node->file_node->file == NULL) // File exists check
+        {
+            sem_wait(fctl_node->file_node->mutex);
+            FILE* f = fopen(file_path, "r");
+            if (f > 0)
+                file_exists = 1;
+            fclose(f);
+            sem_post(fctl_node->file_node->mutex);
+        }
+        else 
+            file_exists = 1;
+        if (file_exists)
+        {
+            ret_fd = v->next_fd++;
+            fctl_node->fd = ret_fd;
+            fctl_node->operations = open_flags;
+            sem_wait(fctl_node->file_node->mutex);
+            fctl_node->file_node->ref_cnt++;
+            sem_post(fctl_node->file_node->mutex);
+        }
+    }
+    
+    // Returning the fd
+    stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
+    if (stat == -1) 
+    {
+        printf("KVM_RUN failed\n");
+        return -1;
+    }
+    if (v->run->exit_reason == KVM_EXIT_IO && v->run->io.port == FILE_PORT && v->run->io.direction == KVM_EXIT_IO_IN)
+        *((uint32_t*)((char*)v->run + v->run->io.data_offset)) = ret_fd;
+    else 
+        return -1;
+
 }
 
 int 
 handleFclose(struct vm* v)
 {
-    
     int stat = 0;
     stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
     if (stat == -1) 
@@ -855,35 +1017,55 @@ handleFclose(struct vm* v)
         return -1;
     }
 
-    uint64_t file_handle = 0;
+    uint32_t file_desc = 0;
     if (v->run->exit_reason == KVM_EXIT_IO && v->run->io.port == FILE_PORT && v->run->io.direction == KVM_EXIT_IO_OUT)
-        file_handle = *((char*)v->run + v->run->io.data_offset);
+        file_desc = *((uint32_t*)((char*)v->run + v->run->io.data_offset));
     else 
         return -1;
 
-    char *file_path = (char*)translateAddr(v, file_handle);
-    printf("Guest File: %s\n", file_path);
+    printf("Guest File Desc: %u\n", file_desc);
 
+    int status;
+    struct file_ctl_node * current = v->files;
+    if (file_desc > 0)
+    {
+        while (current && current->fd != file_desc)
+            current = current->next;
+        
+        if (current)
+        {
+            sem_wait(current->file_node->mutex);
+            current->file_node->ref_cnt--;
+            if (current->file_node->ref_cnt == 0 && current->file_node->file != NULL)
+                fclose(current->file_node->file);
+            sem_post(current->file_node->mutex);
+            current->operations = 0;
+            current->cursor = 0;
+            current->fd = 0;
+            status = 0;
+        }
+        else 
+            status = -2;
+    }
+    else
+        status = -1;
+
+    // Returning the status
     stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
     if (stat == -1) 
     {
         printf("KVM_RUN failed\n");
         return -1;
     }
-
-    uint8_t open_flags = 0;
-    if (v->run->exit_reason == KVM_EXIT_IO && v->run->io.port == FILE_PORT && v->run->io.direction == KVM_EXIT_IO_OUT)
-        open_flags = *((char*)v->run + v->run->io.data_offset);
+    if (v->run->exit_reason == KVM_EXIT_IO && v->run->io.port == FILE_PORT && v->run->io.direction == KVM_EXIT_IO_IN)
+        *((uint32_t*)((char*)v->run + v->run->io.data_offset)) = status;
     else 
         return -1;
-
-    printf("Open flags: %d\n", open_flags);
 }
 
 int 
 handleFread(struct vm* v)
-{
-    
+{   
     int stat = 0;
     stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
     if (stat == -1) 
@@ -892,14 +1074,13 @@ handleFread(struct vm* v)
         return -1;
     }
 
-    uint64_t file_handle = 0;
+    uint32_t file_desc = 0;
     if (v->run->exit_reason == KVM_EXIT_IO && v->run->io.port == FILE_PORT && v->run->io.direction == KVM_EXIT_IO_OUT)
-        file_handle = *((char*)v->run + v->run->io.data_offset);
+        file_desc = *((uint32_t*)((char*)v->run + v->run->io.data_offset));
     else 
         return -1;
 
-    char *file_path = (char*)translateAddr(v, file_handle);
-    printf("Guest File: %s\n", file_path);
+    // printf("Guest File Desc Read: %u\n", file_desc);
 
     stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
     if (stat == -1) 
@@ -908,13 +1089,77 @@ handleFread(struct vm* v)
         return -1;
     }
 
-    uint8_t open_flags = 0;
+    uint64_t buffer_va = 0;
     if (v->run->exit_reason == KVM_EXIT_IO && v->run->io.port == FILE_PORT && v->run->io.direction == KVM_EXIT_IO_OUT)
-        open_flags = *((char*)v->run + v->run->io.data_offset);
+        buffer_va = *((uint64_t*)((char*)v->run + v->run->io.data_offset));
     else 
         return -1;
 
-    printf("Open flags: %d\n", open_flags);
+    char *buffer = (char*)translateAddr(v, buffer_va);
+    uint32_t size = 0, nmemb = 0;
+
+    // Get size
+    stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
+    if (stat == -1) 
+    {
+        printf("KVM_RUN failed\n");
+        return -1;
+    }
+
+    if (v->run->exit_reason == KVM_EXIT_IO && v->run->io.port == FILE_PORT && v->run->io.direction == KVM_EXIT_IO_OUT)
+        size = *((uint32_t*)((char*)v->run + v->run->io.data_offset));
+    else 
+        return -1;
+
+    // Get nmemb
+    stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
+    if (stat == -1) 
+    {
+        printf("KVM_RUN failed\n");
+        return -1;
+    }
+
+    if (v->run->exit_reason == KVM_EXIT_IO && v->run->io.port == FILE_PORT && v->run->io.direction == KVM_EXIT_IO_OUT)
+        nmemb = *((uint32_t*)((char*)v->run + v->run->io.data_offset));
+    else 
+        return -1;
+
+    int read = 0;
+    if (file_desc > 0)
+    {
+        struct file_ctl_node * current = v->files;
+        while (current && current->fd != file_desc)
+            current = current->next;
+        if (current && current->operations & FO_RD)
+        {
+            sem_t *mutex = current->file_node->mutex;
+            sem_wait(mutex);
+            struct file_node* fn = current->file_node;
+            FILE* file = fn->file;
+            if (fn->file == NULL)
+                fn->file = fopen(fn->file_name, "r");
+            if (fn->file > 0)
+            {
+                fseek(fn->file, current->cursor, SEEK_SET);
+                read = fread(buffer, size, nmemb, fn->file);
+                current->cursor = ftell(fn->file);
+            }
+            sem_post(mutex);
+        }
+    }
+    
+    // Returning the status
+    stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
+    if (stat == -1) 
+    {
+        printf("KVM_RUN failed\n");
+        return -1;
+    }
+    if (v->run->exit_reason == KVM_EXIT_IO && v->run->io.port == FILE_PORT && v->run->io.direction == KVM_EXIT_IO_IN)
+        *((uint32_t*)((char*)v->run + v->run->io.data_offset)) = read;
+    else 
+        return -1;
+
 }
 
 int 
@@ -922,6 +1167,7 @@ handleFseek(struct vm* v)
 {
     
     int stat = 0;
+    uint32_t file_desc = 0, offset = 0;
     stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
     if (stat == -1) 
     {
@@ -929,14 +1175,10 @@ handleFseek(struct vm* v)
         return -1;
     }
 
-    uint64_t file_handle = 0;
     if (v->run->exit_reason == KVM_EXIT_IO && v->run->io.port == FILE_PORT && v->run->io.direction == KVM_EXIT_IO_OUT)
-        file_handle = *((char*)v->run + v->run->io.data_offset);
+        file_desc = *((uint32_t*)((char*)v->run + v->run->io.data_offset));
     else 
         return -1;
-
-    char *file_path = (char*)translateAddr(v, file_handle);
-    printf("Guest File: %s\n", file_path);
 
     stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
     if (stat == -1) 
@@ -945,19 +1187,39 @@ handleFseek(struct vm* v)
         return -1;
     }
 
-    uint8_t open_flags = 0;
     if (v->run->exit_reason == KVM_EXIT_IO && v->run->io.port == FILE_PORT && v->run->io.direction == KVM_EXIT_IO_OUT)
-        open_flags = *((char*)v->run + v->run->io.data_offset);
+        offset = *((uint32_t*)((char*)v->run + v->run->io.data_offset));
     else 
         return -1;
+    
+    int status = -1;
 
-    printf("Open flags: %d\n", open_flags);
+    if (file_desc > 0)
+    {
+        struct file_ctl_node * current = v->files;
+        while (current && current->fd != file_desc)
+            current = current->next;
+        current->cursor = offset;
+        printf("New Cursor Position: %lu\n", current->cursor);
+        status = 0;
+    }
+
+    // Returning the status
+    stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
+    if (stat == -1) 
+    {
+        printf("KVM_RUN failed\n");
+        return -1;
+    }
+    if (v->run->exit_reason == KVM_EXIT_IO && v->run->io.port == FILE_PORT && v->run->io.direction == KVM_EXIT_IO_IN)
+        *((uint32_t*)((char*)v->run + v->run->io.data_offset)) = status;
+    else 
+        return -1;
 }
 
 int 
 handleFwrite(struct vm* v)
 {
-    
     int stat = 0;
     stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
     if (stat == -1) 
@@ -966,14 +1228,13 @@ handleFwrite(struct vm* v)
         return -1;
     }
 
-    uint64_t file_handle = 0;
+    uint32_t file_desc = 0;
     if (v->run->exit_reason == KVM_EXIT_IO && v->run->io.port == FILE_PORT && v->run->io.direction == KVM_EXIT_IO_OUT)
-        file_handle = *((char*)v->run + v->run->io.data_offset);
+        file_desc = *((uint32_t*)((char*)v->run + v->run->io.data_offset));
     else 
         return -1;
 
-    char *file_path = (char*)translateAddr(v, file_handle);
-    printf("Guest File: %s\n", file_path);
+    // printf("Guest File Desc Read: %u\n", file_desc);
 
     stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
     if (stat == -1) 
@@ -982,15 +1243,81 @@ handleFwrite(struct vm* v)
         return -1;
     }
 
-    uint8_t open_flags = 0;
+    uint64_t buffer_va = 0;
     if (v->run->exit_reason == KVM_EXIT_IO && v->run->io.port == FILE_PORT && v->run->io.direction == KVM_EXIT_IO_OUT)
-        open_flags = *((char*)v->run + v->run->io.data_offset);
+        buffer_va = *((uint64_t*)((char*)v->run + v->run->io.data_offset));
     else 
         return -1;
 
-    printf("Open flags: %d\n", open_flags);
-}
+    char *buffer = (char*)translateAddr(v, buffer_va);
+    uint32_t size = 0, nmemb = 0;
 
+    // Get size
+    stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
+    if (stat == -1) 
+    {
+        printf("KVM_RUN failed\n");
+        return -1;
+    }
+
+    if (v->run->exit_reason == KVM_EXIT_IO && v->run->io.port == FILE_PORT && v->run->io.direction == KVM_EXIT_IO_OUT)
+        size = *((uint32_t*)((char*)v->run + v->run->io.data_offset));
+    else 
+        return -1;
+
+    // Get nmemb
+    stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
+    if (stat == -1) 
+    {
+        printf("KVM_RUN failed\n");
+        return -1;
+    }
+
+    if (v->run->exit_reason == KVM_EXIT_IO && v->run->io.port == FILE_PORT && v->run->io.direction == KVM_EXIT_IO_OUT)
+        nmemb = *((uint32_t*)((char*)v->run + v->run->io.data_offset));
+    else 
+        return -1;
+
+    int written = 0;
+    if (file_desc > 0)
+    {
+        struct file_ctl_node * current = v->files;
+        while (current && current->fd != file_desc)
+            current = current->next;
+        if (current && current->operations & FO_WR)
+        {
+            sem_t *mutex = current->file_node->mutex;
+            sem_wait(mutex);
+            struct file_node* fn = current->file_node;
+            FILE* file = fn->file;
+            if (fn->file == NULL)
+                if (current->operations & FO_RDWR)
+                    fn->file = fopen(fn->file_name, "w+");
+                else 
+                    fn->file = fopen(fn->file_name, "w");
+            
+            if (fn->file > 0)
+            {
+                fseek(fn->file, current->cursor, SEEK_SET);
+                written = fwrite(buffer, size, nmemb, fn->file);
+                current->cursor = ftell(fn->file);
+            }
+            sem_post(mutex);
+        }
+    }
+    
+    // Returning the status
+    stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
+    if (stat == -1) 
+    {
+        printf("KVM_RUN failed\n");
+        return -1;
+    }
+    if (v->run->exit_reason == KVM_EXIT_IO && v->run->io.port == FILE_PORT && v->run->io.direction == KVM_EXIT_IO_IN)
+        *((uint32_t*)((char*)v->run + v->run->io.data_offset)) = written;
+    else 
+        return -1;
+}
 
 int 
 handleFilePortOperation(struct vm* v)

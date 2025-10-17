@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <stdlib.h>
 
 // Ports
 #define BYTE_PORT 0xE9
@@ -99,32 +100,63 @@ typedef struct file
 	uint32_t fd;
 } FILE;
 
-static FILE* fopen(const char* file_path, int flags)
+static int fopen(FILE* file, const char* file_path, int flags)
 {
 	outb(FILE_PORT, F_OPEN);
 	outl(FILE_PORT, (uint32_t)(uintptr_t)file_path);
 	outb(FILE_PORT, flags);
+	int file_desc = inl(FILE_PORT);
+	if (file_desc <= 0)
+		return file_desc;	
+	file->fd = file_desc;
 	return 0;
 }
 
-static int fread(FILE* file, char* buffer, uint32_t size)
-{
-	return 0;
+static int fread(FILE* file, char* buffer, uint32_t size, uint32_t nmemb)
+{	
+	if (file->fd <= 0)
+		return 0;
+	outb(FILE_PORT, F_READ);
+	outl(FILE_PORT, file->fd);
+	outl(FILE_PORT, (uint32_t)(uintptr_t)buffer);
+	outl(FILE_PORT, size);
+	outl(FILE_PORT, nmemb);
+	int read = inl(FILE_PORT);
+	return read;
 }
 
-static int fwrite(FILE* file, char* buffer, uint32_t size)
+static int fwrite(FILE* file, char* buffer, uint32_t size, uint32_t nmemb)
 {
-	return 0;
+	if (file->fd <= 0)
+		return 0;
+	outb(FILE_PORT, F_WRITE);
+	outl(FILE_PORT, file->fd);
+	outl(FILE_PORT, (uint32_t)(uintptr_t)buffer);
+	outl(FILE_PORT, size);
+	outl(FILE_PORT, nmemb);
+	int written = inl(FILE_PORT);
+	return written;
 }
 
 static int fseek(FILE* file, uint32_t offset)
 {
-	return 0;
+	if (file->fd <= 0)
+		return -1;
+	outb(FILE_PORT, F_SEEK);
+	outl(FILE_PORT, file->fd);
+	outl(FILE_PORT, offset);
+	int status = inl(FILE_PORT);
+	return status;
 }
 
 static int fclose(FILE* file)
-{
-	return 0;
+{	
+	if (file->fd <= 0)
+		return -1;
+	outb(FILE_PORT, F_CLOSE);
+	outl(FILE_PORT, file->fd);
+	int status = inl(FILE_PORT);
+	return status;
 }
 
 void
@@ -135,8 +167,33 @@ _start(void) {
 	/*
 		INSERT CODE BELOW THIS LINE
 	*/
+	FILE file;
+	char * buffer = "Not ReadP";
+	print(buffer);
+	print("\n");
+	fopen(&file, "text_file.txt", FO_RDWR);
+	
+	fread(&file, buffer, 1, 10);
 
-	fopen("Ajmo da vidimo", FO_RDWR);
+	print(buffer);
+	print("\n");
+
+	fseek(&file, 0);
+
+	char* wbuffer = "Write This";
+	fwrite(&file, wbuffer, 1, 11);
+
+	fseek(&file, 0);
+
+	char * new_buffer = "No WriteHr";
+	fread(&file, new_buffer, 1, 11);
+
+	print(new_buffer);
+	print("\n");
+
+	fclose(&file);
+
+	
 
 	/*
 		INSERT CODE ABOVE THIS LINE
