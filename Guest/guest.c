@@ -169,25 +169,18 @@ _start(void) {
 	*/
 	FILE file;
 	char * buffer = "Not ReadP";
-	print(buffer);
-	print("\n");
-	
+
 	fopen(&file, "text_file.txt", FO_RDWR);
 	
-	fread(&file, buffer, 1, 10);
+	fread(&file, buffer, 1, 9);
 
 	print(buffer);
 	print("\n");
 
 	fseek(&file, 0);
 
-	char* wbuffer = "Write This";
-	fwrite(&file, wbuffer, 1, 11);
-
-	fseek(&file, 0);
-
-	char * new_buffer = "No WriteHr";
-	fread(&file, new_buffer, 1, 11);
+	char * new_buffer = "No ReadP2";
+	fread(&file, new_buffer, 1, 9);
 
 	print(new_buffer);
 	print("\n");

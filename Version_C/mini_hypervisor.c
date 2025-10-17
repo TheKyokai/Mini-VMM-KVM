@@ -46,9 +46,6 @@
 struct file_node
 {
 	char* file_name;
-    sem_t* mutex;
-    FILE* file;
-    int ref_cnt;
 	struct file_node *next;
 };
 
@@ -60,11 +57,11 @@ struct file_node* push_file(struct file_node **head, char *name);
 struct file_ctl_node
 {
     char* name;
+    char* actual_name;
     uint32_t fd;
     uint8_t shared;
     uint8_t operations;
-    uint64_t cursor;
-    struct file_node* file_node;
+    FILE* handle;
     struct file_ctl_node *next;
 };
 
@@ -119,6 +116,7 @@ void outb(struct vm *v);
 int handleFilePortOperation(struct vm* v);
 
 struct file_node *file_list = NULL;
+sem_t* file_mutex = NULL;
 
 int 
 main(int argc, char *argv[])
@@ -126,6 +124,8 @@ main(int argc, char *argv[])
     int arg_status;
     size_t mem_size, page_size;
 	struct file_node *guest_list = NULL;
+    file_mutex = malloc(sizeof(sem_t));
+    sem_init(file_mutex, 0, 1);
     if ((arg_status = parse_arguments(argc, argv, &mem_size, &page_size, &guest_list, &file_list)) < 0)
         return arg_status;
 	
@@ -151,20 +151,22 @@ main(int argc, char *argv[])
 		}
         node->v.next_fd = 1;
         int i=0;
+        sem_wait(file_mutex);
         struct file_node* fnode = get_file_at(file_list, i);
         while (fnode)
         {
             struct file_ctl_node * fctl_node = (struct file_ctl_node*)malloc(sizeof(struct file_ctl_node));
-            fctl_node->cursor = 0;
-            fctl_node->file_node = fnode;
             fctl_node->name = fnode->file_name;
+            fctl_node->actual_name = fnode->file_name;
             fctl_node->operations = 0;
             fctl_node->shared = 1;
+            fctl_node->handle = NULL;
             fctl_node->next = NULL;
             push_file_ctl(&node->v.files, fctl_node);
 
             fnode = get_file_at(file_list, ++i);
         }
+        sem_post(file_mutex);
 
         pthread_t thread_id;
         stat = pthread_create(&thread_id, NULL, vm_start, (void*)(&node->v));
@@ -668,7 +670,6 @@ vm_run(struct vm *v, pthread_t thread_id)
 		stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
 		if (stat == -1) {
 			printf("KVM_RUN failed\n");
-			vm_destroy(v);
 			return -1;
 		}
 
@@ -821,26 +822,18 @@ struct file_node*
 push_file(struct file_node **head, char *name)
 {
 	if (!head) return NULL;
-    sem_t* mutex = (sem_t*)malloc(sizeof(sem_t));
-    sem_init(mutex, 0, 1);
 	if (!*head)
 	{
 		*head = (struct file_node*) malloc(sizeof(struct file_node));
 		(*head)->file_name = name;
-        (*head)->file = NULL;
 		(*head)->next = NULL;
-        (*head)->ref_cnt = 0;
-        (*head)->mutex = mutex;
 		return *head;
 	}
 	struct file_node *current = *head;
 	for (; current->next; current = current->next);
 	struct file_node *node = (struct file_node*) malloc(sizeof(struct file_node));
 	node->file_name = name;
-    node->file = NULL;
 	node->next = NULL;
-    node->ref_cnt = 0;
-    node->mutex = mutex;
 
 	current->next = node;
 	return node;
@@ -958,25 +951,20 @@ get_name(char* old_name)
 int 
 create_copy_on_write(struct file_ctl_node * node)
 {
-    char * new_name = get_name(node->file_node->file_name);
+    char * new_name = get_name(node->name);
     if (!new_name)
         return -1;
-    sem_t *mutex = node->file_node->mutex;
-    sem_wait(mutex);
-    struct file_node* fn = node->file_node;
-    printf("Copying %s to %s\n", fn->file_name, new_name);
-
-    FILE* tempIn = fopen(fn->file_name, "rb");
-    if (tempIn <= 0){
-        sem_post(mutex);
+    
+    FILE* tempIn = fopen(node->name, "rb");
+    if (tempIn <= 0)
         return-1;
-    }
+    
     FILE* tempOut = fopen(new_name, "wb");
     if (tempOut <= 0){
         fclose(tempIn);
-        sem_post(mutex);
         return-1;
     }
+
     char buffer[8192];
     size_t n;
     while ((n = fread(buffer, 1, sizeof(buffer), tempIn)) > 0) 
@@ -985,22 +973,20 @@ create_copy_on_write(struct file_ctl_node * node)
     fclose(tempIn);
     fclose(tempOut);
 
-    fn->ref_cnt--;
-    if (fn->ref_cnt == 0 && fn->file != NULL)
-        fclose(fn->file);
+    uint32_t offset = 0;
+    if (node->handle != NULL)
+    {
+        offset = ftell(node->handle);
+        fclose(node->handle);
+    }
 
     
-    struct file_node* fn_new = push_file(&file_list, new_name);
-
     node->shared = 0;
-    node->file_node = fn_new;
+    node->actual_name = new_name;
 
-    fn_new->ref_cnt++;
-    fn_new->file = fopen(new_name, "r+");
-    sem_post(mutex);
+    node->handle = fopen(node->actual_name, "r+");
     return 0;
 }
-
 
 int 
 handleFopen(struct vm* v)
@@ -1045,14 +1031,14 @@ handleFopen(struct vm* v)
         fctl_node = fctl_node->next;
     if (fctl_node && fctl_node->operations == 0) // File provided as argument check
     {
-        if (open_flags & FO_RD && fctl_node->file_node->file == NULL) // File exists check
+        if (open_flags == FO_RD && fctl_node->handle == NULL) // File exists check
         {
-            sem_wait(fctl_node->file_node->mutex);
             FILE* f = fopen(file_path, "r");
             if (f > 0)
+            {
                 file_exists = 1;
-            fclose(f);
-            sem_post(fctl_node->file_node->mutex);
+            }
+            fclose(f);   
         }
         else 
             file_exists = 1;
@@ -1061,9 +1047,6 @@ handleFopen(struct vm* v)
             ret_fd = v->next_fd++;
             fctl_node->fd = ret_fd;
             fctl_node->operations = open_flags;
-            sem_wait(fctl_node->file_node->mutex);
-            fctl_node->file_node->ref_cnt++;
-            sem_post(fctl_node->file_node->mutex);
         }
     }
     
@@ -1098,7 +1081,7 @@ handleFclose(struct vm* v)
     else 
         return -1;
 
-    // printf("Guest File Desc: %u\n", file_desc);
+    printf("Guest File Desc Close: %u\n", file_desc);
 
     int status;
     struct file_ctl_node * current = v->files;
@@ -1109,13 +1092,9 @@ handleFclose(struct vm* v)
         
         if (current)
         {
-            sem_wait(current->file_node->mutex);
-            current->file_node->ref_cnt--;
-            if (current->file_node->ref_cnt == 0 && current->file_node->file != NULL)
-                fclose(current->file_node->file);
-            sem_post(current->file_node->mutex);
+            if (current->handle != NULL)
+                fclose(current->handle);
             current->operations = 0;
-            current->cursor = 0;
             current->fd = 0;
             status = 0;
         }
@@ -1154,8 +1133,6 @@ handleFread(struct vm* v)
         file_desc = *((uint32_t*)((char*)v->run + v->run->io.data_offset));
     else 
         return -1;
-
-    // printf("Guest File Desc Read: %u\n", file_desc);
 
     stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
     if (stat == -1) 
@@ -1199,6 +1176,9 @@ handleFread(struct vm* v)
     else 
         return -1;
 
+
+    printf("Guest File Desc Read: %u\n", file_desc);
+
     int read = 0;
     if (file_desc > 0)
     {
@@ -1207,19 +1187,16 @@ handleFread(struct vm* v)
             current = current->next;
         if (current && current->operations & FO_RD)
         {
-            sem_t *mutex = current->file_node->mutex;
-            sem_wait(mutex);
-            struct file_node* fn = current->file_node;
-            FILE* file = fn->file;
-            if (fn->file == NULL)
-                fn->file = fopen(fn->file_name, "r");
-            if (fn->file > 0)
+            FILE* file = current->handle;
+            if (file == NULL)
             {
-                fseek(fn->file, current->cursor, SEEK_SET);
-                read = fread(buffer, size, nmemb, fn->file);
-                current->cursor = ftell(fn->file);
+                file = fopen(current->actual_name, "r");
+                current->handle = file;
             }
-            sem_post(mutex);
+            if (file > 0)
+            {
+                read = fread(buffer, size, nmemb, file);
+            }
         }
     }
     
@@ -1274,7 +1251,21 @@ handleFseek(struct vm* v)
         struct file_ctl_node * current = v->files;
         while (current && current->fd != file_desc)
             current = current->next;
-        current->cursor = offset;
+        
+        if (current && current->operations > 0)
+        {   
+            if (current->operations & FO_RD)
+            {
+                current->handle = fopen(current->actual_name, "r");
+            }
+            else 
+            {
+                status = create_copy_on_write(current);
+            }
+            if (current->handle)
+                status = fseek(current->handle, offset, SEEK_SET);  
+        }
+
         // printf("New Cursor Position: %lu\n", current->cursor);
         status = 0;
     }
@@ -1309,7 +1300,7 @@ handleFwrite(struct vm* v)
     else 
         return -1;
 
-    // printf("Guest File Desc Read: %u\n", file_desc);
+    printf("Guest File Desc Write: %u\n", file_desc);
 
     stat = ioctl(v->vcpu_fd, KVM_RUN, 0);
     if (stat == -1) 
@@ -1369,10 +1360,7 @@ handleFwrite(struct vm* v)
             }
             if (!status)
             {
-                FILE* file = current->file_node->file;
-                fseek(file, current->cursor, SEEK_SET);
-                written = fwrite(buffer, size, nmemb, file);
-                current->cursor = ftell(file);
+                written = fwrite(buffer, size, nmemb, current->handle);   
             } 
         }
     }
@@ -1394,19 +1382,29 @@ int
 handleFilePortOperation(struct vm* v)
 {   
     uint8_t file_op = *((char*)v->run + v->run->io.data_offset);
-    
+    sem_wait(file_mutex);
+    int status = 0;
     switch(file_op)
     {
         case F_OPEN:
-            return handleFopen(v);
+            status =  handleFopen(v);
+            break;
         case F_CLOSE:
-            return handleFclose(v);
+            status =  handleFclose(v);
+            break;
         case F_READ:
-            return handleFread(v);
+            status = handleFread(v);
+            break;
         case F_SEEK:
-            return handleFseek(v);
+            status = handleFseek(v);
+            break;
         case F_WRITE:
-            return handleFwrite(v);
+            status = handleFwrite(v);
+            break;
+        default:
+            status = -1;
+            break;
     }
-    return -1;
+    sem_post(file_mutex);
+    return status;
 }
